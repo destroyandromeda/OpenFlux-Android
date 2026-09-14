@@ -427,13 +427,13 @@ type relayClient struct {
 	config VolgaConfig
 	stats  *VolgaStats
 
-	httpClient *http.Client
-	workers    int
-	queue      chan []byte
-	batchQueue chan [][]byte
-	wg         sync.WaitGroup
-	ctx        context.Context
-	cancel     context.CancelFunc
+	httpClients []*http.Client
+	workers     int
+	queue       chan []byte
+	batchQueue  chan [][]byte
+	wg          sync.WaitGroup
+	ctx         context.Context
+	cancel      context.CancelFunc
 
 	bundleID atomic.Uint64
 	seq      atomic.Uint64
@@ -444,30 +444,34 @@ type relayClient struct {
 }
 
 func newRelayClient(auth *volgaAuth, cfg VolgaConfig, stats *VolgaStats) *relayClient {
-	tr := &http.Transport{
-		MaxIdleConns:        cfg.MaxIdleConns,
-		MaxIdleConnsPerHost: cfg.MaxIdleConnsPerHost,
-		IdleConnTimeout:     cfg.IdleConnTimeout,
-		DisableCompression:  true,
-		ForceAttemptHTTP2:   true,
-	}
-
 	ctx, cancel := context.WithCancel(context.Background())
-
-	return &relayClient{
-		auth:   auth,
-		config: cfg,
-		stats:  stats,
-		httpClient: &http.Client{
+	const connectionCount = 4
+	httpClients := make([]*http.Client, connectionCount)
+	for i := range httpClients {
+		tr := &http.Transport{
+			MaxIdleConns:        cfg.MaxIdleConns,
+			MaxIdleConnsPerHost: cfg.MaxIdleConnsPerHost,
+			IdleConnTimeout:     cfg.IdleConnTimeout,
+			DisableCompression:  true,
+			ForceAttemptHTTP2:   true,
+		}
+		httpClients[i] = &http.Client{
 			Transport: tr,
 			Timeout:   cfg.RelayTimeout,
 			Jar:       auth.Session.Jar,
-		},
-		workers:    cfg.WorkerCount,
-		queue:      make(chan []byte, cfg.QueueSize),
-		batchQueue: make(chan [][]byte, cfg.WorkerCount*4),
-		ctx:        ctx,
-		cancel:     cancel,
+		}
+	}
+
+	return &relayClient{
+		auth:        auth,
+		config:      cfg,
+		stats:       stats,
+		httpClients: httpClients,
+		workers:     cfg.WorkerCount,
+		queue:       make(chan []byte, cfg.QueueSize),
+		batchQueue:  make(chan [][]byte, cfg.WorkerCount*4),
+		ctx:         ctx,
+		cancel:      cancel,
 	}
 }
 
@@ -485,6 +489,9 @@ func (r *relayClient) Start() {
 func (r *relayClient) Stop() {
 	r.cancel()
 	r.wg.Wait()
+	for _, client := range r.httpClients {
+		client.CloseIdleConnections()
+	}
 }
 
 func (r *relayClient) Send(data []byte) error {
@@ -574,7 +581,7 @@ func (r *relayClient) worker(id int) {
 			return
 		case batch := <-r.batchQueue:
 			r.stats.WorkerBusy.Add(1)
-			err := r.sendBatchWithRetry(batch)
+			err := r.sendBatchWithRetry(batch, id)
 			if err != nil {
 				r.stats.HTTPReqsFailed.Add(1)
 				utils.Debugf("[VOLGA] batch send failed: %v", err)
@@ -587,7 +594,7 @@ func (r *relayClient) worker(id int) {
 	}
 }
 
-func (r *relayClient) sendBatch(batch [][]byte) error {
+func (r *relayClient) sendBatch(batch [][]byte, connection int) error {
 	blob := blobBufPool.Get().(*bytes.Buffer)
 	blob.Reset()
 
@@ -680,7 +687,8 @@ func (r *relayClient) sendBatch(batch [][]byte) error {
 		req.Header.Set("Cookie", strings.Join(cookieParts, "; "))
 	}
 
-	resp, err := r.httpClient.Do(req)
+	client := r.httpClients[connection%len(r.httpClients)]
+	resp, err := client.Do(req)
 	if err != nil {
 		return err
 	}
@@ -705,11 +713,11 @@ func (e *relayHTTPError) Error() string {
 	return fmt.Sprintf("status %d", e.status)
 }
 
-func (r *relayClient) sendBatchWithRetry(batch [][]byte) error {
+func (r *relayClient) sendBatchWithRetry(batch [][]byte, connection int) error {
 	const maxAttempts = 4
 
 	for attempt := 1; attempt <= maxAttempts; attempt++ {
-		err := r.sendBatch(batch)
+		err := r.sendBatch(batch, connection+attempt-1)
 		if err == nil {
 			return nil
 		}
