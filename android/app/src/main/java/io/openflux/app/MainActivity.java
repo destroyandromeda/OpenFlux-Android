@@ -232,7 +232,8 @@ public final class MainActivity extends Activity {
     }
 
     private void handleAdbIntent(Intent intent) {
-        if (!BuildConfig.DEBUG || intent == null || !intent.getBooleanExtra("adb_start_vpn", false)) return;
+        boolean debuggable = (getApplicationInfo().flags & android.content.pm.ApplicationInfo.FLAG_DEBUGGABLE) != 0;
+        if (!debuggable || intent == null || !intent.getBooleanExtra("adb_start_vpn", false)) return;
         intent.removeExtra("adb_start_vpn");
         handler.postDelayed(() -> {
             if (!isConnectionRunning()) toggleConnection();
