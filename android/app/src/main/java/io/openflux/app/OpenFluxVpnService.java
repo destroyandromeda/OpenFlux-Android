@@ -38,6 +38,7 @@ public final class OpenFluxVpnService extends VpnService {
     public static final String EXTRA_ENCRYPTION_SECRET = "encryption_secret";
     public static final String EXTRA_DNS_SERVER = "dns_server";
     public static final String EXTRA_MTU = "mtu";
+    public static final String EXTRA_TRANSPORT = "transport";
 
     private static final String CHANNEL_ID = "openflux_vpn";
     private static final int NOTIFICATION_ID = 7;
@@ -151,6 +152,8 @@ public final class OpenFluxVpnService extends VpnService {
         String dnsServer = intent.getStringExtra(EXTRA_DNS_SERVER);
         String encryptionSecretExtra = intent.getStringExtra(EXTRA_ENCRYPTION_SECRET);
         final String encryptionSecret = encryptionSecretExtra == null ? "" : encryptionSecretExtra;
+        String transportExtra = intent == null ? null : intent.getStringExtra(EXTRA_TRANSPORT);
+        final String transportName = (transportExtra == null || transportExtra.isEmpty()) ? "vyandex" : transportExtra;
         if (!encryptionSecret.isEmpty() && encryptionSecret.length() < 16) {
             lastError = "Ключ шифрования должен быть не короче 16 символов, либо оставьте поле пустым";
             status = "Ошибка";
@@ -158,7 +161,7 @@ public final class OpenFluxVpnService extends VpnService {
             stopSelf();
             return START_NOT_STICKY;
         }
-        if (dnsServer == null || dnsServer.trim().isEmpty()) dnsServer = "1.1.1.1";
+        if (dnsServer == null || dnsServer.trim().isEmpty()) dnsServer = "77.88.8.8";
         int mtu = Math.max(576, Math.min(1500, intent.getIntExtra(EXTRA_MTU, 1400)));
 
         active = true;
@@ -168,13 +171,13 @@ public final class OpenFluxVpnService extends VpnService {
         int session = generation.incrementAndGet();
         String selectedDns = dnsServer;
         int selectedMtu = mtu;
-        workers.execute(() -> startTunnel(url, encryptionSecret, selectedDns, selectedMtu, session));
+        workers.execute(() -> startTunnel(url, encryptionSecret, transportName, selectedDns, selectedMtu, session));
         return START_STICKY;
     }
 
-    private void startTunnel(String url, String encryptionSecret, String dnsServer, int mtu, int session) {
+    private void startTunnel(String url, String encryptionSecret, String transportName, String dnsServer, int mtu, int session) {
         if (!isCurrent(session)) return;
-        String error = Mobile.start(url, encryptionSecret);
+        String error = Mobile.start(url, encryptionSecret, transportName);
         if (error != null && !error.isEmpty()) {
             fail(session, error);
             return;
@@ -340,10 +343,58 @@ public final class OpenFluxVpnService extends VpnService {
             byte[] buffer = new byte[4096];
             DatagramPacket response = new DatagramPacket(buffer, buffer.length);
             socket.receive(response);
-            return Arrays.copyOf(buffer, response.getLength());
+            return stripAaaa(Arrays.copyOf(buffer, response.getLength()));
         } catch (SocketTimeoutException timeout) {
             return null;
         }
+    }
+
+    // stripAaaa removes AAAA (IPv6) records from a DNS response, keeping only
+    // IPv4 A records. The OpenFlux tunnel is IPv4-only, so an AAAA-first answer
+    // (e.g. youtube.com) makes apps pick IPv6 and hang.
+    private static byte[] stripAaaa(byte[] dns) {
+        if (dns == null || dns.length < 12) return dns;
+        int ancount = unsignedShort(dns, 6);
+        if (ancount == 0) return dns;
+
+        int offset = 12;
+        int qdcount = unsignedShort(dns, 4);
+        for (int i = 0; i < qdcount && offset < dns.length; i++) {
+            offset = skipDnsName(dns, offset);
+            offset += 4;
+        }
+
+        java.io.ByteArrayOutputStream out = new java.io.ByteArrayOutputStream(dns.length);
+        out.write(dns, 0, offset);
+        int kept = 0;
+        for (int i = 0; i < ancount && offset < dns.length; i++) {
+            int nameStart = offset;
+            int nameEnd = skipDnsName(dns, offset);
+            if (nameEnd + 10 > dns.length) return dns;
+            int type = unsignedShort(dns, nameEnd);
+            int rdlength = unsignedShort(dns, nameEnd + 8);
+            if (nameEnd + 10 + rdlength > dns.length) return dns;
+            if (type == 1) {
+                out.write(dns, nameStart, nameEnd - nameStart);
+                out.write(dns, nameEnd, 10 + rdlength);
+                kept++;
+            }
+            offset = nameEnd + 10 + rdlength;
+        }
+        byte[] result = out.toByteArray();
+        result[6] = (byte) ((kept >> 8) & 0xff);
+        result[7] = (byte) (kept & 0xff);
+        return result;
+    }
+
+    private static int skipDnsName(byte[] dns, int offset) {
+        while (offset < dns.length) {
+            int len = dns[offset] & 0xff;
+            if (len == 0) return offset + 1;
+            if ((len & 0xc0) == 0xc0) return offset + 2;
+            offset += 1 + len;
+        }
+        return offset;
     }
 
     private void inject(int session, FileOutputStream output, byte[] packet) throws IOException {

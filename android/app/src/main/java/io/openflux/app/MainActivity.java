@@ -91,7 +91,7 @@ import io.openflux.bridge.mobile.Mobile;
 public final class MainActivity extends Activity {
     private static final int VPN_PERMISSION_REQUEST = 42;
     private static final int NOTIFICATION_PERMISSION_REQUEST = 43;
-    private static final String DEFAULT_DNS = "1.1.1.1";
+    private static final String DEFAULT_DNS = "77.88.8.8";
     private static final int DEFAULT_MTU = 1400;
     private static final int PAGE_HOME = 0;
     private static final int PAGE_LOGS = 1;
@@ -150,6 +150,7 @@ public final class MainActivity extends Activity {
     private String documentUrl;
     private String encryptionSecret;
     private String dnsServer;
+    private String transportName = "vyandex";
     private int mtu;
     private String connectionMode = MODE_VPN;
     private int proxyPort = DEFAULT_PROXY_PORT;
@@ -196,6 +197,7 @@ public final class MainActivity extends Activity {
         // connection credentials now live only in the Keystore-backed store.
         prefs.edit().remove("document_url").remove("connection_document_url").apply();
         documentUrl = secureSettings.getString("document_url", "");
+        transportName = getPreferences(MODE_PRIVATE).getString("transport", "vyandex");
         encryptionSecret = secureSettings.getString("encryption_secret", "");
         dnsServer = prefs.getString("dns_server", DEFAULT_DNS);
         mtu = prefs.getInt("mtu", DEFAULT_MTU);
@@ -1257,8 +1259,37 @@ public final class MainActivity extends Activity {
         return scroll;
     }
 
+    // Переключатель транспорта: vyandex (Volga, по умолчанию) или yandex (legacy)
+    private View buildTransportPicker() {
+        LinearLayout row = new LinearLayout(this);
+        row.setOrientation(LinearLayout.HORIZONTAL);
+        row.setGravity(Gravity.CENTER_VERTICAL);
+        row.setPadding(dp(4), dp(6), dp(4), dp(6));
+        row.setBackground(rounded(surface, border, 1, 10));
+
+        LinearLayout copy = new LinearLayout(this);
+        copy.setOrientation(LinearLayout.VERTICAL);
+        copy.setPadding(dp(12), dp(4), dp(8), dp(4));
+        copy.addView(text("Транспорт", 15, text, true));
+        copy.addView(text(transportName.equals("yandex")
+                ? "Yandex Docs (legacy)"
+                : "Volga (vyandex)", 12, secondary, false));
+        row.addView(copy, new LinearLayout.LayoutParams(0, -2, 1f));
+
+        final TextView value = (TextView) copy.getChildAt(1);
+        row.setOnClickListener(v -> {
+            tap(v);
+            transportName = transportName.equals("yandex") ? "vyandex" : "yandex";
+            value.setText(transportName.equals("yandex")
+                    ? "Yandex Docs (legacy)"
+                    : "Volga (vyandex)");
+        });
+        return row;
+    }
+
     private View buildTransportSettings() {
         LinearLayout section = page();
+        section.addView(buildTransportPicker(), matchWrap());
         section.addView(buildUrlField(), new LinearLayout.LayoutParams(-1, dp(56)));
 
         LinearLayout.LayoutParams encryptionParams = new LinearLayout.LayoutParams(-1, dp(56));
@@ -1741,6 +1772,7 @@ public final class MainActivity extends Activity {
                 .putString("proxy_username", proxyUsername)
                 .putBoolean("auto_scroll", autoScroll)
                 .putBoolean("dark_mode", darkMode)
+                .putString("transport", transportName)
                 .commit();
     }
 
@@ -1808,6 +1840,8 @@ public final class MainActivity extends Activity {
         intent.putExtra(OpenFluxVpnService.EXTRA_ENCRYPTION_SECRET, encryptionSecret);
         intent.putExtra(OpenFluxVpnService.EXTRA_DNS_SERVER, dnsServer);
         intent.putExtra(OpenFluxVpnService.EXTRA_MTU, mtu);
+        String tr = getSharedPreferences("openflux_settings", MODE_PRIVATE).getString("transport", "vyandex");
+        intent.putExtra(OpenFluxVpnService.EXTRA_TRANSPORT, tr);
         startForegroundService(intent);
         appendLog("Запуск VPN…");
     }

@@ -34,7 +34,9 @@ func appendLog(message string) {
 
 // Start connects the packet transport. It returns an empty string on success
 // and a user-readable error on failure.
-func Start(documentURL, encryptionSecret string) string {
+// Start connects the packet transport. transport is "yandex" (legacy cursor
+// transport) or "vyandex" (Volga). Returns empty string on success.
+func Start(documentURL, encryptionSecret, transportName string) string {
 	if documentURL == "" {
 		return "Ссылка на документ не указана"
 	}
@@ -54,10 +56,16 @@ func Start(documentURL, encryptionSecret string) string {
 
 	utils.EnableDebug()
 	utils.SetLogSink(appendLog)
-	appendLog("[ANDROID] Запуск транспорта Yandex Docs")
 
 	config := transport.DefaultConfig()
-	var inner transport.Transport = yandex.NewYandexDocsTransport(documentURL, config)
+	var inner transport.Transport
+	if transportName == "yandex" {
+		appendLog("[ANDROID] Запуск транспорта Yandex Docs (yandex)")
+		inner = yandex.NewYandexDocsTransport(documentURL, config)
+	} else {
+		appendLog("[ANDROID] Запуск транспорта Volga (vyandex)")
+		inner = yandex.NewYandexVolgaTransport(documentURL, config)
+	}
 	if encryptionSecret != "" {
 		encrypted, err := transport.NewEncryptedTransport(inner, encryptionSecret, documentURL, false)
 		if err != nil {

@@ -51,12 +51,12 @@ type VolgaConfig struct {
 
 func DefaultVolgaConfig() VolgaConfig {
 	return VolgaConfig{
-		MaxIdleConnsPerHost: 2000,
-		MaxIdleConns:        4000,
+		MaxIdleConnsPerHost: 128,
+		MaxIdleConns:        256,
 		IdleConnTimeout:     90 * time.Second,
 		RelayTimeout:        30 * time.Second,
 
-		WorkerCount: 2000,
+		WorkerCount: 128,
 		QueueSize:   1000000,
 
 		BatchSize:     20,
@@ -522,7 +522,7 @@ func (r *relayClient) worker(id int) {
 			return
 		}
 		r.stats.WorkerBusy.Add(1)
-		err := r.sendBatch(batch)
+		err := r.sendBatchWithRetry(batch)
 		if err != nil {
 			r.stats.HTTPReqsFailed.Add(1)
 			utils.Debugf("[VOLGA] batch send failed: %v", err)
@@ -662,13 +662,56 @@ func (r *relayClient) sendBatch(batch [][]byte) error {
 	io.Copy(io.Discard, resp.Body)
 
 	if resp.StatusCode != 204 && resp.StatusCode != 200 {
-		return fmt.Errorf("status %d", resp.StatusCode)
+		return &relayHTTPError{status: resp.StatusCode}
 	}
 
 	r.stats.PacketsSent.Add(uint64(len(batch)))
 	r.stats.PacketsBatched.Add(uint64(len(batch)))
 	r.stats.BytesSent.Add(uint64(totalBytes))
 	return nil
+}
+
+type relayHTTPError struct {
+	status int
+}
+
+func (e *relayHTTPError) Error() string {
+	return fmt.Sprintf("status %d", e.status)
+}
+
+func (r *relayClient) sendBatchWithRetry(batch [][]byte) error {
+	const maxAttempts = 4
+
+	for attempt := 1; attempt <= maxAttempts; attempt++ {
+		err := r.sendBatch(batch)
+		if err == nil {
+			return nil
+		}
+		if attempt == maxAttempts || !isRetryableRelayError(err) {
+			return err
+		}
+
+		delay := time.Duration(attempt*attempt) * 100 * time.Millisecond
+		utils.Debugf("[VOLGA] transient relay error (%v), retry %d/%d in %v",
+			err, attempt, maxAttempts-1, delay)
+		timer := time.NewTimer(delay)
+		select {
+		case <-timer.C:
+		case <-r.ctx.Done():
+			timer.Stop()
+			return r.ctx.Err()
+		}
+	}
+	return nil
+}
+
+func isRetryableRelayError(err error) bool {
+	if statusErr, ok := err.(*relayHTTPError); ok {
+		return statusErr.status == http.StatusRequestTimeout ||
+			statusErr.status == http.StatusTooManyRequests ||
+			statusErr.status >= 500
+	}
+	return true
 }
 
 func (r *relayClient) SetFrontier(opID string) {
