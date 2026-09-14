@@ -624,10 +624,10 @@ func (r *relayClient) worker(id int) {
 		case batch := <-r.batchQueue:
 			r.stats.WorkerBusy.Add(1)
 			err := r.sendBatchWithRetry(batch, id)
-			if err != nil {
+			if err != nil && !errors.Is(err, context.Canceled) {
 				r.stats.HTTPReqsFailed.Add(1)
 				utils.Debugf("[VOLGA] batch send failed: %v", err)
-			} else {
+			} else if err == nil {
 				r.stats.HTTPReqsSent.Add(1)
 				r.stats.BatchesSent.Add(1)
 			}
@@ -815,11 +815,12 @@ func (r *relayClient) getFrontier() []interface{} {
 }
 
 type wsListener struct {
-	auth   *volgaAuth
-	config VolgaConfig
-	stats  *VolgaStats
-	relay  *relayClient
-	onData func([]byte)
+	auth    *volgaAuth
+	config  VolgaConfig
+	stats   *VolgaStats
+	onData  func([]byte)
+	relayMu sync.RWMutex
+	relay   *relayClient
 
 	ctx    context.Context
 	cancel context.CancelFunc
@@ -861,6 +862,12 @@ func (w *wsListener) Stop() {
 		w.gapTimer = nil
 	}
 	w.reorderMu.Unlock()
+}
+
+func (w *wsListener) SetRelay(relay *relayClient) {
+	w.relayMu.Lock()
+	w.relay = relay
+	w.relayMu.Unlock()
 }
 
 func (w *wsListener) run() {
@@ -1026,7 +1033,12 @@ func (w *wsListener) handleBundleItem(raw json.RawMessage) {
 	}
 	if err := json.Unmarshal(raw, &asObj); err == nil && asObj.Action != "" {
 		if asObj.ID != "" {
-			w.relay.SetFrontier(asObj.ID)
+			w.relayMu.RLock()
+			relay := w.relay
+			w.relayMu.RUnlock()
+			if relay != nil {
+				relay.SetFrontier(asObj.ID)
+			}
 		}
 		return
 	}
@@ -1362,6 +1374,21 @@ func (t *YandexVolgaTransport) recoverSession(refreshAuth bool) error {
 
 	newRelay := newRelayClient(auth, t.config, t.stats)
 	newRelay.Start()
+	if !refreshAuth {
+		t.relayMu.Lock()
+		oldRelay, ws := t.relay, t.ws
+		t.relay = newRelay
+		if ws != nil {
+			ws.SetRelay(newRelay)
+		}
+		t.relayMu.Unlock()
+		if oldRelay != nil {
+			oldRelay.Stop()
+		}
+		utils.Debugf("[VOLGA] relay pool rebuilt: user=%d rp=%s", auth.UserID, auth.RequestPath)
+		return nil
+	}
+
 	newWS := newWSListener(auth, t.config, t.stats, newRelay, func(data []byte) {
 		t.onDataMu.RLock()
 		cb := t.onData
