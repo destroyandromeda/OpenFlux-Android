@@ -6,6 +6,7 @@ import (
 	"encoding/base64"
 	"encoding/binary"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -51,16 +52,16 @@ type VolgaConfig struct {
 
 func DefaultVolgaConfig() VolgaConfig {
 	return VolgaConfig{
-		MaxIdleConnsPerHost: 32,
-		MaxIdleConns:        64,
+		MaxIdleConnsPerHost: 16,
+		MaxIdleConns:        32,
 		IdleConnTimeout:     90 * time.Second,
 		RelayTimeout:        30 * time.Second,
 
-		WorkerCount: 32,
+		WorkerCount: 16,
 		QueueSize:   8192,
 
-		BatchSize:     20,
-		BatchTimeout:  2 * time.Millisecond,
+		BatchSize:     32,
+		BatchTimeout:  10 * time.Millisecond,
 		BatchMaxBytes: 4 * 1024 * 1024,
 
 		MaxPayloadBytes: 5_000_000,
@@ -446,9 +447,10 @@ func newRelayClient(auth *volgaAuth, cfg VolgaConfig, stats *VolgaStats) *relayC
 	tr := &http.Transport{
 		MaxIdleConns:        cfg.MaxIdleConns,
 		MaxIdleConnsPerHost: cfg.MaxIdleConnsPerHost,
+		MaxConnsPerHost:     cfg.MaxIdleConnsPerHost,
 		IdleConnTimeout:     cfg.IdleConnTimeout,
 		DisableCompression:  true,
-		ForceAttemptHTTP2:   true,
+		ForceAttemptHTTP2:   false,
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -731,6 +733,9 @@ func (r *relayClient) sendBatchWithRetry(batch [][]byte) error {
 }
 
 func isRetryableRelayError(err error) bool {
+	if errors.Is(err, context.Canceled) {
+		return false
+	}
 	if statusErr, ok := err.(*relayHTTPError); ok {
 		return statusErr.status == http.StatusRequestTimeout ||
 			statusErr.status == http.StatusTooManyRequests ||
