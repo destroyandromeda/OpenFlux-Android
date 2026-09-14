@@ -222,6 +222,21 @@ public final class MainActivity extends Activity {
         appendLog("Готово. При первом запуске Android запросит разрешение на VPN.");
         checkForUpdates();
         requestNotificationPermissionIfNeeded();
+        handleAdbIntent(getIntent());
+    }
+
+    @Override protected void onNewIntent(Intent intent) {
+        super.onNewIntent(intent);
+        setIntent(intent);
+        handleAdbIntent(intent);
+    }
+
+    private void handleAdbIntent(Intent intent) {
+        if (!BuildConfig.DEBUG || intent == null || !intent.getBooleanExtra("adb_start_vpn", false)) return;
+        intent.removeExtra("adb_start_vpn");
+        handler.postDelayed(() -> {
+            if (!isConnectionRunning()) toggleConnection();
+        }, 500);
     }
 
     // Android 13+ requires this runtime permission to actually display any

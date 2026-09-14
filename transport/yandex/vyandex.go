@@ -52,16 +52,16 @@ type VolgaConfig struct {
 
 func DefaultVolgaConfig() VolgaConfig {
 	return VolgaConfig{
-		MaxIdleConnsPerHost: 16,
-		MaxIdleConns:        32,
+		MaxIdleConnsPerHost: 2000,
+		MaxIdleConns:        4000,
 		IdleConnTimeout:     90 * time.Second,
 		RelayTimeout:        30 * time.Second,
 
-		WorkerCount: 16,
+		WorkerCount: 2000,
 		QueueSize:   8192,
 
-		BatchSize:     128,
-		BatchTimeout:  50 * time.Millisecond,
+		BatchSize:     20,
+		BatchTimeout:  2 * time.Millisecond,
 		BatchMaxBytes: 4 * 1024 * 1024,
 
 		MaxPayloadBytes: 5_000_000,
@@ -445,7 +445,7 @@ type relayClient struct {
 
 func newRelayClient(auth *volgaAuth, cfg VolgaConfig, stats *VolgaStats) *relayClient {
 	ctx, cancel := context.WithCancel(context.Background())
-	const connectionCount = 4
+	const connectionCount = 1
 	httpClients := make([]*http.Client, connectionCount)
 	for i := range httpClients {
 		tr := &http.Transport{
