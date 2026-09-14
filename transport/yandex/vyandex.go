@@ -3,6 +3,7 @@ package yandex
 import (
 	"bytes"
 	"context"
+	cryptorand "crypto/rand"
 	"encoding/base64"
 	"encoding/binary"
 	"encoding/json"
@@ -422,6 +423,13 @@ func minInt(a, b int) int {
 	return b
 }
 
+var sequencedBatchMagic = [4]byte{'O', 'F', 'B', 1}
+
+type relayBatch struct {
+	sequence uint64
+	packets  [][]byte
+}
+
 type relayClient struct {
 	auth   *volgaAuth
 	config VolgaConfig
@@ -430,7 +438,7 @@ type relayClient struct {
 	httpClients []*http.Client
 	workers     int
 	queue       chan []byte
-	batchQueue  chan [][]byte
+	batchQueue  chan relayBatch
 	wg          sync.WaitGroup
 	ctx         context.Context
 	cancel      context.CancelFunc
@@ -438,6 +446,8 @@ type relayClient struct {
 	bundleID atomic.Uint64
 	seq      atomic.Uint64
 	localID  atomic.Uint64
+	batchSeq atomic.Uint64
+	epoch    uint64
 
 	mu       sync.Mutex
 	frontier string
@@ -445,6 +455,14 @@ type relayClient struct {
 
 func newRelayClient(auth *volgaAuth, cfg VolgaConfig, stats *VolgaStats) *relayClient {
 	ctx, cancel := context.WithCancel(context.Background())
+	var epochBytes [8]byte
+	if _, err := cryptorand.Read(epochBytes[:]); err != nil {
+		binary.BigEndian.PutUint64(epochBytes[:], uint64(time.Now().UnixNano()))
+	}
+	epoch := binary.BigEndian.Uint64(epochBytes[:])
+	if epoch == 0 {
+		epoch = 1
+	}
 	const connectionCount = 1
 	httpClients := make([]*http.Client, connectionCount)
 	for i := range httpClients {
@@ -467,9 +485,10 @@ func newRelayClient(auth *volgaAuth, cfg VolgaConfig, stats *VolgaStats) *relayC
 		config:      cfg,
 		stats:       stats,
 		httpClients: httpClients,
+		epoch:       epoch,
 		workers:     cfg.WorkerCount,
 		queue:       make(chan []byte, cfg.QueueSize),
-		batchQueue:  make(chan [][]byte, cfg.WorkerCount*4),
+		batchQueue:  make(chan relayBatch, cfg.WorkerCount*4),
 		ctx:         ctx,
 		cancel:      cancel,
 	}
@@ -537,7 +556,7 @@ func (r *relayClient) batcher() {
 		if len(batch) == 0 {
 			return true
 		}
-		ready := batch
+		ready := relayBatch{sequence: r.batchSeq.Add(1), packets: batch}
 		batch = make([][]byte, 0, r.config.BatchSize)
 		totalBytes = 0
 		select {
@@ -594,13 +613,18 @@ func (r *relayClient) worker(id int) {
 	}
 }
 
-func (r *relayClient) sendBatch(batch [][]byte, connection int) error {
+func (r *relayClient) sendBatch(batch relayBatch, connection int) error {
 	blob := blobBufPool.Get().(*bytes.Buffer)
 	blob.Reset()
+	blob.Write(sequencedBatchMagic[:])
+	var sequenceHeader [16]byte
+	binary.BigEndian.PutUint64(sequenceHeader[:8], r.epoch)
+	binary.BigEndian.PutUint64(sequenceHeader[8:], batch.sequence)
+	blob.Write(sequenceHeader[:])
 
 	var lenBuf [2]byte
 	var totalBytes int
-	for _, p := range batch {
+	for _, p := range batch.packets {
 		binary.BigEndian.PutUint16(lenBuf[:], uint16(len(p)))
 		blob.Write(lenBuf[:])
 		blob.Write(p)
@@ -699,8 +723,8 @@ func (r *relayClient) sendBatch(batch [][]byte, connection int) error {
 		return &relayHTTPError{status: resp.StatusCode}
 	}
 
-	r.stats.PacketsSent.Add(uint64(len(batch)))
-	r.stats.PacketsBatched.Add(uint64(len(batch)))
+	r.stats.PacketsSent.Add(uint64(len(batch.packets)))
+	r.stats.PacketsBatched.Add(uint64(len(batch.packets)))
 	r.stats.BytesSent.Add(uint64(totalBytes))
 	return nil
 }
@@ -713,7 +737,7 @@ func (e *relayHTTPError) Error() string {
 	return fmt.Sprintf("status %d", e.status)
 }
 
-func (r *relayClient) sendBatchWithRetry(batch [][]byte, connection int) error {
+func (r *relayClient) sendBatchWithRetry(batch relayBatch, connection int) error {
 	const maxAttempts = 4
 
 	for attempt := 1; attempt <= maxAttempts; attempt++ {
@@ -775,6 +799,13 @@ type wsListener struct {
 
 	ctx    context.Context
 	cancel context.CancelFunc
+
+	reorderMu      sync.Mutex
+	receiveEpoch   uint64
+	nextSequence   uint64
+	pendingBatches map[uint64][][]byte
+	retiredEpochs  map[uint64]struct{}
+	gapTimer       *time.Timer
 }
 
 func newWSListener(auth *volgaAuth, cfg VolgaConfig, stats *VolgaStats,
@@ -782,13 +813,15 @@ func newWSListener(auth *volgaAuth, cfg VolgaConfig, stats *VolgaStats,
 
 	ctx, cancel := context.WithCancel(context.Background())
 	return &wsListener{
-		auth:   auth,
-		config: cfg,
-		stats:  stats,
-		relay:  relay,
-		onData: onData,
-		ctx:    ctx,
-		cancel: cancel,
+		auth:           auth,
+		config:         cfg,
+		stats:          stats,
+		relay:          relay,
+		onData:         onData,
+		ctx:            ctx,
+		cancel:         cancel,
+		pendingBatches: make(map[uint64][][]byte),
+		retiredEpochs:  make(map[uint64]struct{}),
 	}
 }
 
@@ -798,6 +831,12 @@ func (w *wsListener) Start() {
 
 func (w *wsListener) Stop() {
 	w.cancel()
+	w.reorderMu.Lock()
+	if w.gapTimer != nil {
+		w.gapTimer.Stop()
+		w.gapTimer = nil
+	}
+	w.reorderMu.Unlock()
 }
 
 func (w *wsListener) run() {
@@ -974,15 +1013,121 @@ func (w *wsListener) handleBundleItem(raw json.RawMessage) {
 		if err != nil {
 			return
 		}
-		packets := decodeBatch(decoded)
-		w.stats.PacketsRecv.Add(uint64(len(packets)))
-		w.stats.BytesReceived.Add(uint64(len(decoded)))
-		for _, pkt := range packets {
-			if w.onData != nil {
-				w.onData(pkt)
-			}
+		epoch, sequence, packets, sequenced := decodeSequencedBatch(decoded)
+		if !sequenced {
+			w.deliverPackets(decodeBatch(decoded))
+			return
+		}
+		w.handleSequencedBatch(epoch, sequence, packets)
+	}
+}
+
+func (w *wsListener) handleSequencedBatch(epoch, sequence uint64, packets [][]byte) {
+	w.reorderMu.Lock()
+	if _, retired := w.retiredEpochs[epoch]; retired {
+		w.reorderMu.Unlock()
+		return
+	}
+	if w.receiveEpoch != epoch {
+		if w.receiveEpoch != 0 {
+			w.retiredEpochs[w.receiveEpoch] = struct{}{}
+		}
+		w.receiveEpoch = epoch
+		w.nextSequence = 1
+		w.pendingBatches = make(map[uint64][][]byte)
+		if w.gapTimer != nil {
+			w.gapTimer.Stop()
+			w.gapTimer = nil
 		}
 	}
+	if sequence < w.nextSequence {
+		w.reorderMu.Unlock()
+		return
+	}
+	if _, duplicate := w.pendingBatches[sequence]; duplicate {
+		w.reorderMu.Unlock()
+		return
+	}
+	w.pendingBatches[sequence] = packets
+	ready := w.collectReadyLocked()
+	if len(w.pendingBatches) > 0 && w.gapTimer == nil {
+		currentEpoch := w.receiveEpoch
+		w.gapTimer = time.AfterFunc(500*time.Millisecond, func() {
+			w.flushSequenceGap(currentEpoch)
+		})
+	}
+	w.reorderMu.Unlock()
+	w.deliverPackets(ready)
+}
+
+func (w *wsListener) collectReadyLocked() [][]byte {
+	var ready [][]byte
+	for {
+		packets, ok := w.pendingBatches[w.nextSequence]
+		if !ok {
+			break
+		}
+		delete(w.pendingBatches, w.nextSequence)
+		w.nextSequence++
+		ready = append(ready, packets...)
+	}
+	if len(w.pendingBatches) == 0 && w.gapTimer != nil {
+		w.gapTimer.Stop()
+		w.gapTimer = nil
+	}
+	return ready
+}
+
+func (w *wsListener) flushSequenceGap(epoch uint64) {
+	w.reorderMu.Lock()
+	if w.receiveEpoch != epoch || len(w.pendingBatches) == 0 {
+		w.gapTimer = nil
+		w.reorderMu.Unlock()
+		return
+	}
+	lowest := ^uint64(0)
+	for sequence := range w.pendingBatches {
+		if sequence < lowest {
+			lowest = sequence
+		}
+	}
+	w.nextSequence = lowest
+	w.gapTimer = nil
+	ready := w.collectReadyLocked()
+	if len(w.pendingBatches) > 0 {
+		currentEpoch := w.receiveEpoch
+		w.gapTimer = time.AfterFunc(500*time.Millisecond, func() {
+			w.flushSequenceGap(currentEpoch)
+		})
+	}
+	w.reorderMu.Unlock()
+	w.deliverPackets(ready)
+}
+
+func (w *wsListener) deliverPackets(packets [][]byte) {
+	if len(packets) == 0 {
+		return
+	}
+	w.stats.PacketsRecv.Add(uint64(len(packets)))
+	for _, pkt := range packets {
+		w.stats.BytesReceived.Add(uint64(len(pkt)))
+		if w.onData != nil {
+			w.onData(pkt)
+		}
+	}
+}
+
+func decodeSequencedBatch(decoded []byte) (uint64, uint64, [][]byte, bool) {
+	const headerSize = 20
+	if len(decoded) < headerSize || !bytes.Equal(decoded[:4], sequencedBatchMagic[:]) {
+		return 0, 0, nil, false
+	}
+	epoch := binary.BigEndian.Uint64(decoded[4:12])
+	sequence := binary.BigEndian.Uint64(decoded[12:20])
+	if epoch == 0 || sequence == 0 {
+		return 0, 0, nil, false
+	}
+	return epoch, sequence, decodeBatch(decoded[headerSize:]), true
 }
 
 func decodeBatch(decoded []byte) [][]byte {
