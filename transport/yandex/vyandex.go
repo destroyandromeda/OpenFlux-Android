@@ -109,20 +109,21 @@ func base64Encode(data []byte) string {
 }
 
 type VolgaStats struct {
-	PacketsSent    atomic.Uint64
-	PacketsRecv    atomic.Uint64
-	BytesSent      atomic.Uint64
-	BytesReceived  atomic.Uint64
-	HTTPReqsSent   atomic.Uint64
-	HTTPReqsFailed atomic.Uint64
-	WSReconnects   atomic.Uint64
-	QueueDrops     atomic.Uint64
-	WorkerBusy     atomic.Int64
-	BatchesSent    atomic.Uint64
-	PacketsBatched atomic.Uint64
-	OutOfOrder     atomic.Uint64
-	Duplicates     atomic.Uint64
-	GapsSkipped    atomic.Uint64
+	PacketsSent     atomic.Uint64
+	PacketsRecv     atomic.Uint64
+	BytesSent       atomic.Uint64
+	BytesReceived   atomic.Uint64
+	HTTPReqsSent    atomic.Uint64
+	HTTPReqsFailed  atomic.Uint64
+	WSReconnects    atomic.Uint64
+	QueueDrops      atomic.Uint64
+	WorkerBusy      atomic.Int64
+	BatchesSent     atomic.Uint64
+	PacketsBatched  atomic.Uint64
+	OutOfOrder      atomic.Uint64
+	Duplicates      atomic.Uint64
+	GapsSkipped     atomic.Uint64
+	LastHTTPSuccess atomic.Int64
 }
 
 type volgaAuth struct {
@@ -138,6 +139,7 @@ type volgaAuth struct {
 	TS          string
 	SessionID   string
 	Cookies     []*http.Cookie
+	TokenTTL    int64
 }
 
 func authorize(docURL string) (*volgaAuth, error) {
@@ -238,12 +240,27 @@ func authorize(docURL string) (*volgaAuth, error) {
 	utils.Debugf("[VOLGA] action_url: %s", actionURL)
 	utils.Debugf("[VOLGA] access_token: %d bytes", len(accessToken))
 	utils.Debugf("[VOLGA] access_token_ttl: %v (%T)", ttl, ttl)
+	var ttlInt int64
+	switch v := ttl.(type) {
+	case json.Number:
+		if parsed, err := v.Int64(); err == nil {
+			ttlInt = parsed
+		}
+	case float64:
+		ttlInt = int64(v)
+	case int64:
+		ttlInt = v
+	}
+	if ttlInt > 0 {
+		ttlInt /= 1000
+	}
 
 	a := &volgaAuth{
 		Session:     session,
 		AccessToken: accessToken,
 		ResourceURL: getStr(office, "resource_url"),
 		DocID:       getStr(editor, "idDoc"),
+		TokenTTL:    ttlInt,
 	}
 
 	if actionURL == "" {
@@ -466,6 +483,7 @@ func newRelayClient(auth *volgaAuth, cfg VolgaConfig, stats *VolgaStats) *relayC
 	if epoch == 0 {
 		epoch = 1
 	}
+	stats.LastHTTPSuccess.Store(time.Now().UnixNano())
 	const connectionCount = 1
 	httpClients := make([]*http.Client, connectionCount)
 	for i := range httpClients {
@@ -528,6 +546,8 @@ func (r *relayClient) Send(data []byte) error {
 	copy(cp, data)
 
 	select {
+	case <-r.ctx.Done():
+		return r.ctx.Err()
 	case r.queue <- cp:
 		return nil
 	default:
@@ -729,6 +749,7 @@ func (r *relayClient) sendBatch(batch relayBatch, connection int) error {
 	r.stats.PacketsSent.Add(uint64(len(batch.packets)))
 	r.stats.PacketsBatched.Add(uint64(len(batch.packets)))
 	r.stats.BytesSent.Add(uint64(totalBytes))
+	r.stats.LastHTTPSuccess.Store(time.Now().UnixNano())
 	return nil
 }
 
@@ -1165,14 +1186,17 @@ type YandexVolgaTransport struct {
 	config VolgaConfig
 	stats  *VolgaStats
 
-	auth  *volgaAuth
-	relay *relayClient
-	ws    *wsListener
+	auth      *volgaAuth
+	relay     *relayClient
+	ws        *wsListener
+	relayMu   sync.RWMutex
+	recoverMu sync.Mutex
 
 	onDataMu sync.RWMutex
 	onData   func([]byte)
 
 	keepAliveStop chan struct{}
+	tokenExpiry   int64
 }
 
 func NewYandexVolgaTransport(docURL string, cfg transport.TransportConfig) *YandexVolgaTransport {
@@ -1196,6 +1220,7 @@ func (t *YandexVolgaTransport) Start() error {
 		return fmt.Errorf("auth: %w", err)
 	}
 	t.auth = auth
+	t.tokenExpiry = auth.TokenTTL
 
 	t.relay = newRelayClient(auth, t.config, t.stats)
 	t.relay.Start()
@@ -1226,21 +1251,30 @@ func (t *YandexVolgaTransport) Stop() error {
 	default:
 		close(t.keepAliveStop)
 	}
-	if t.ws != nil {
-		t.ws.Stop()
+	t.recoverMu.Lock()
+	t.relayMu.Lock()
+	ws, relay := t.ws, t.relay
+	t.ws, t.relay = nil, nil
+	t.relayMu.Unlock()
+	if ws != nil {
+		ws.Stop()
 	}
-	if t.relay != nil {
-		t.relay.Stop()
+	if relay != nil {
+		relay.Stop()
 	}
+	t.recoverMu.Unlock()
 	t.SetConnected(false)
 	return t.BaseTransport.Stop()
 }
 
 func (t *YandexVolgaTransport) Send(data []byte) error {
-	if t.relay == nil {
+	t.relayMu.RLock()
+	relay := t.relay
+	t.relayMu.RUnlock()
+	if relay == nil {
 		return fmt.Errorf("transport not started")
 	}
-	return t.relay.Send(data)
+	return relay.Send(data)
 }
 
 func (t *YandexVolgaTransport) Receive(callback func([]byte)) {
@@ -1278,9 +1312,81 @@ func (t *YandexVolgaTransport) keepAliveLoop() {
 			if !t.IsRunning() {
 				return
 			}
-			_ = t.relay.Send([]byte{0x00})
+			now := time.Now()
+			if t.tokenExpiry > 0 && now.Unix() > t.tokenExpiry-300 {
+				utils.Debugf("[VOLGA] access token expiring, re-authorizing...")
+				if err := t.recoverSession(true); err != nil {
+					utils.Debugf("[VOLGA] reauthorize failed: %v", err)
+				}
+				continue
+			}
+			lastSuccess := time.Unix(0, t.stats.LastHTTPSuccess.Load())
+			if t.stats.WorkerBusy.Load() >= 64 && now.Sub(lastSuccess) > 15*time.Second {
+				utils.Debugf("[VOLGA] relay stalled for %v with %d busy workers, rebuilding session",
+					now.Sub(lastSuccess).Round(time.Second), t.stats.WorkerBusy.Load())
+				if err := t.recoverSession(false); err != nil {
+					utils.Debugf("[VOLGA] session rebuild failed: %v", err)
+				}
+				continue
+			}
+			t.relayMu.RLock()
+			relay := t.relay
+			t.relayMu.RUnlock()
+			if relay != nil {
+				_ = relay.Send([]byte{0x00})
+			}
 		}
 	}
+}
+
+func (t *YandexVolgaTransport) recoverSession(refreshAuth bool) error {
+	t.recoverMu.Lock()
+	defer t.recoverMu.Unlock()
+	if !t.IsRunning() {
+		return context.Canceled
+	}
+
+	t.relayMu.RLock()
+	auth := t.auth
+	t.relayMu.RUnlock()
+	if refreshAuth {
+		var err error
+		auth, err = authorize(t.docURL)
+		if err != nil {
+			return err
+		}
+	}
+	if auth == nil {
+		return fmt.Errorf("transport has no authorization")
+	}
+
+	newRelay := newRelayClient(auth, t.config, t.stats)
+	newRelay.Start()
+	newWS := newWSListener(auth, t.config, t.stats, newRelay, func(data []byte) {
+		t.onDataMu.RLock()
+		cb := t.onData
+		t.onDataMu.RUnlock()
+		if cb != nil {
+			cb(data)
+		}
+		t.RecordReceive(len(data))
+	})
+	newWS.Start()
+
+	t.relayMu.Lock()
+	oldWS, oldRelay := t.ws, t.relay
+	t.auth, t.relay, t.ws = auth, newRelay, newWS
+	t.tokenExpiry = auth.TokenTTL
+	t.relayMu.Unlock()
+	if oldWS != nil {
+		oldWS.Stop()
+	}
+	if oldRelay != nil {
+		oldRelay.Stop()
+	}
+	t.SetConnected(true)
+	utils.Debugf("[VOLGA] session rebuilt: user=%d rp=%s", auth.UserID, auth.RequestPath)
+	return nil
 }
 
 func (t *YandexVolgaTransport) statsLoop() {
