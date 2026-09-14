@@ -10,8 +10,8 @@ android {
         applicationId "io.openflux.app"
         minSdk 26
         targetSdk 35
-        versionCode 26
-        versionName "397e7da"
+        versionCode 27
+        versionName "b676644"
 
     }
 
