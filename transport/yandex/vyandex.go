@@ -60,8 +60,8 @@ func DefaultVolgaConfig() VolgaConfig {
 		WorkerCount: 16,
 		QueueSize:   8192,
 
-		BatchSize:     32,
-		BatchTimeout:  10 * time.Millisecond,
+		BatchSize:     128,
+		BatchTimeout:  50 * time.Millisecond,
 		BatchMaxBytes: 4 * 1024 * 1024,
 
 		MaxPayloadBytes: 5_000_000,
@@ -447,10 +447,9 @@ func newRelayClient(auth *volgaAuth, cfg VolgaConfig, stats *VolgaStats) *relayC
 	tr := &http.Transport{
 		MaxIdleConns:        cfg.MaxIdleConns,
 		MaxIdleConnsPerHost: cfg.MaxIdleConnsPerHost,
-		MaxConnsPerHost:     cfg.MaxIdleConnsPerHost,
 		IdleConnTimeout:     cfg.IdleConnTimeout,
 		DisableCompression:  true,
-		ForceAttemptHTTP2:   false,
+		ForceAttemptHTTP2:   true,
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
