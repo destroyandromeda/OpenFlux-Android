@@ -120,6 +120,9 @@ type VolgaStats struct {
 	WorkerBusy     atomic.Int64
 	BatchesSent    atomic.Uint64
 	PacketsBatched atomic.Uint64
+	OutOfOrder     atomic.Uint64
+	Duplicates     atomic.Uint64
+	GapsSkipped    atomic.Uint64
 }
 
 type volgaAuth struct {
@@ -1041,12 +1044,17 @@ func (w *wsListener) handleSequencedBatch(epoch, sequence uint64, packets [][]by
 		}
 	}
 	if sequence < w.nextSequence {
+		w.stats.Duplicates.Add(1)
 		w.reorderMu.Unlock()
 		return
 	}
 	if _, duplicate := w.pendingBatches[sequence]; duplicate {
+		w.stats.Duplicates.Add(1)
 		w.reorderMu.Unlock()
 		return
+	}
+	if sequence > w.nextSequence {
+		w.stats.OutOfOrder.Add(1)
 	}
 	w.pendingBatches[sequence] = packets
 	ready := w.collectReadyLocked()
@@ -1090,6 +1098,9 @@ func (w *wsListener) flushSequenceGap(epoch uint64) {
 		if sequence < lowest {
 			lowest = sequence
 		}
+	}
+	if lowest > w.nextSequence {
+		w.stats.GapsSkipped.Add(lowest - w.nextSequence)
 	}
 	w.nextSequence = lowest
 	w.gapTimer = nil
@@ -1292,13 +1303,14 @@ func (t *YandexVolgaTransport) statsLoop() {
 			batches := t.stats.BatchesSent.Load()
 			batched := t.stats.PacketsBatched.Load()
 
-			utils.Debugf("[VOLGA-STATS] send %d pkt/s (%d KB/s) | http %d req/s fail %d | batch %d (avg %.1f pkt) | recv %d pkt/s (%d KB/s) | busy %d/%d",
+			utils.Debugf("[VOLGA-STATS] send %d pkt/s (%d KB/s) | http %d req/s fail %d | batch %d (avg %.1f pkt) | recv %d pkt/s (%d KB/s) | busy %d/%d | order %d dup %d gaps %d",
 				(sent-lastSent)/5, (bytes-lastBytes)/5/1024,
 				(httpReqs-lastHTTP)/5, failed-lastFailed,
 				(batches-lastBatches)/5,
 				float64(batched-lastBatched)/float64(maxU64(batches-lastBatches, 1)),
 				(recv-lastRecv)/5, (recvBytes-lastRecvBytes)/5/1024,
-				t.stats.WorkerBusy.Load(), t.config.WorkerCount)
+				t.stats.WorkerBusy.Load(), t.config.WorkerCount,
+				t.stats.OutOfOrder.Load(), t.stats.Duplicates.Load(), t.stats.GapsSkipped.Load())
 
 			lastSent, lastBytes = sent, bytes
 			lastHTTP, lastFailed = httpReqs, failed
