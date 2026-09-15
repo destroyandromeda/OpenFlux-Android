@@ -1315,6 +1315,7 @@ func (t *YandexVolgaTransport) Stats() transport.TransportStats {
 func (t *YandexVolgaTransport) keepAliveLoop() {
 	ticker := time.NewTicker(t.config.KeepAliveInterval)
 	defer ticker.Stop()
+	var busySince time.Time
 
 	for {
 		select {
@@ -1332,14 +1333,21 @@ func (t *YandexVolgaTransport) keepAliveLoop() {
 				}
 				continue
 			}
-			lastSuccess := time.Unix(0, t.stats.LastHTTPSuccess.Load())
-			if t.stats.WorkerBusy.Load() >= 256 && now.Sub(lastSuccess) > 2*t.config.RelayTimeout {
-				utils.Debugf("[VOLGA] relay stalled for %v with %d busy workers, rebuilding session",
-					now.Sub(lastSuccess).Round(time.Second), t.stats.WorkerBusy.Load())
-				if err := t.recoverSession(false); err != nil {
-					utils.Debugf("[VOLGA] session rebuild failed: %v", err)
+			busy := t.stats.WorkerBusy.Load()
+			if busy >= 256 {
+				if busySince.IsZero() {
+					busySince = now
+				} else if now.Sub(busySince) >= 2*t.config.RelayTimeout {
+					utils.Debugf("[VOLGA] relay saturated for %v with %d busy workers, rebuilding pool",
+						now.Sub(busySince).Round(time.Second), busy)
+					if err := t.recoverSession(false); err != nil {
+						utils.Debugf("[VOLGA] relay pool rebuild failed: %v", err)
+					}
+					busySince = time.Time{}
+					continue
 				}
-				continue
+			} else {
+				busySince = time.Time{}
 			}
 			t.relayMu.RLock()
 			relay := t.relay
