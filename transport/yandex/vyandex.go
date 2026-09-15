@@ -822,8 +822,10 @@ type wsListener struct {
 	relayMu sync.RWMutex
 	relay   *relayClient
 
-	ctx    context.Context
-	cancel context.CancelFunc
+	ctx       context.Context
+	cancel    context.CancelFunc
+	ready     chan struct{}
+	readyOnce sync.Once
 
 	reorderMu      sync.Mutex
 	receiveEpoch   uint64
@@ -845,6 +847,7 @@ func newWSListener(auth *volgaAuth, cfg VolgaConfig, stats *VolgaStats,
 		onData:         onData,
 		ctx:            ctx,
 		cancel:         cancel,
+		ready:          make(chan struct{}),
 		pendingBatches: make(map[uint64][][]byte),
 		retiredEpochs:  make(map[uint64]struct{}),
 	}
@@ -868,6 +871,17 @@ func (w *wsListener) SetRelay(relay *relayClient) {
 	w.relayMu.Lock()
 	w.relay = relay
 	w.relayMu.Unlock()
+}
+
+func (w *wsListener) WaitConnected(timeout time.Duration) error {
+	select {
+	case <-w.ready:
+		return nil
+	case <-w.ctx.Done():
+		return w.ctx.Err()
+	case <-time.After(timeout):
+		return fmt.Errorf("websocket connection timed out after %v", timeout)
+	}
 }
 
 func (w *wsListener) run() {
@@ -936,6 +950,7 @@ func (w *wsListener) connect() error {
 	defer conn.Close()
 
 	utils.Debugf("[VOLGA] WS connected: user=%s", w.auth.UserIDStr)
+	w.readyOnce.Do(func() { close(w.ready) })
 
 	for {
 		select {
@@ -1340,7 +1355,7 @@ func (t *YandexVolgaTransport) keepAliveLoop() {
 				} else if now.Sub(busySince) >= 2*t.config.RelayTimeout {
 					utils.Debugf("[VOLGA] relay saturated for %v with %d busy workers, rebuilding pool",
 						now.Sub(busySince).Round(time.Second), busy)
-					if err := t.recoverSession(false); err != nil {
+					if err := t.recoverSession(true); err != nil {
 						utils.Debugf("[VOLGA] relay pool rebuild failed: %v", err)
 					}
 					busySince = time.Time{}
@@ -1407,6 +1422,11 @@ func (t *YandexVolgaTransport) recoverSession(refreshAuth bool) error {
 		t.RecordReceive(len(data))
 	})
 	newWS.Start()
+	if err := newWS.WaitConnected(t.config.WSHandshakeTimeout + t.config.ReconnectMaxDelay); err != nil {
+		newWS.Stop()
+		newRelay.Stop()
+		return err
+	}
 
 	t.relayMu.Lock()
 	oldWS, oldRelay := t.ws, t.relay
