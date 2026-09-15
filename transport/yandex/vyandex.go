@@ -1333,7 +1333,7 @@ func (t *YandexVolgaTransport) keepAliveLoop() {
 				continue
 			}
 			lastSuccess := time.Unix(0, t.stats.LastHTTPSuccess.Load())
-			if t.stats.WorkerBusy.Load() >= 64 && now.Sub(lastSuccess) > 15*time.Second {
+			if t.stats.WorkerBusy.Load() >= 256 && now.Sub(lastSuccess) > 2*t.config.RelayTimeout {
 				utils.Debugf("[VOLGA] relay stalled for %v with %d busy workers, rebuilding session",
 					now.Sub(lastSuccess).Round(time.Second), t.stats.WorkerBusy.Load())
 				if err := t.recoverSession(false); err != nil {
