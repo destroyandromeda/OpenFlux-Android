@@ -343,47 +343,33 @@ public final class OpenFluxVpnService extends VpnService {
             byte[] buffer = new byte[4096];
             DatagramPacket response = new DatagramPacket(buffer, buffer.length);
             socket.receive(response);
-            return stripAaaa(Arrays.copyOf(buffer, response.getLength()));
+            return filterAaaaResponse(query, Arrays.copyOf(buffer, response.getLength()));
         } catch (SocketTimeoutException timeout) {
             return null;
         }
     }
 
-    // stripAaaa removes AAAA (IPv6) records from a DNS response, keeping only
-    // IPv4 A records. The OpenFlux tunnel is IPv4-only, so an AAAA-first answer
-    // (e.g. youtube.com) makes apps pick IPv6 and hang.
-    private static byte[] stripAaaa(byte[] dns) {
-        if (dns == null || dns.length < 12) return dns;
-        int ancount = unsignedShort(dns, 6);
-        if (ancount == 0) return dns;
-
-        int offset = 12;
-        int qdcount = unsignedShort(dns, 4);
-        for (int i = 0; i < qdcount && offset < dns.length; i++) {
-            offset = skipDnsName(dns, offset);
-            offset += 4;
+    // The tunnel is IPv4-only. Return valid NODATA for AAAA without rewriting
+    // compressed resource records; all other response types remain untouched.
+    static byte[] filterAaaaResponse(byte[] query, byte[] response) {
+        if (query == null || response == null || query.length < 12 || response.length < 12) return response;
+        if (unsignedShort(query, 4) == 0) return response;
+        int queryNameEnd = skipDnsName(query, 12);
+        if (queryNameEnd < 0 || queryNameEnd + 4 > query.length || unsignedShort(query, queryNameEnd) != 28) {
+            return response;
         }
 
-        java.io.ByteArrayOutputStream out = new java.io.ByteArrayOutputStream(dns.length);
-        out.write(dns, 0, offset);
-        int kept = 0;
-        for (int i = 0; i < ancount && offset < dns.length; i++) {
-            int nameStart = offset;
-            int nameEnd = skipDnsName(dns, offset);
-            if (nameEnd + 10 > dns.length) return dns;
-            int type = unsignedShort(dns, nameEnd);
-            int rdlength = unsignedShort(dns, nameEnd + 8);
-            if (nameEnd + 10 + rdlength > dns.length) return dns;
-            if (type == 1) {
-                out.write(dns, nameStart, nameEnd - nameStart);
-                out.write(dns, nameEnd, 10 + rdlength);
-                kept++;
-            }
-            offset = nameEnd + 10 + rdlength;
+        int responseOffset = 12;
+        int questionCount = unsignedShort(response, 4);
+        for (int i = 0; i < questionCount; i++) {
+            responseOffset = skipDnsName(response, responseOffset);
+            if (responseOffset < 0 || responseOffset + 4 > response.length) return response;
+            responseOffset += 4;
         }
-        byte[] result = out.toByteArray();
-        result[6] = (byte) ((kept >> 8) & 0xff);
-        result[7] = (byte) (kept & 0xff);
+
+        byte[] result = Arrays.copyOf(response, responseOffset);
+        result[2] &= (byte) ~0x02; // The synthesized response is complete, not truncated.
+        Arrays.fill(result, 6, 12, (byte) 0);
         return result;
     }
 
@@ -391,10 +377,11 @@ public final class OpenFluxVpnService extends VpnService {
         while (offset < dns.length) {
             int len = dns[offset] & 0xff;
             if (len == 0) return offset + 1;
-            if ((len & 0xc0) == 0xc0) return offset + 2;
+            if ((len & 0xc0) == 0xc0) return offset + 2 <= dns.length ? offset + 2 : -1;
+            if ((len & 0xc0) != 0 || len > 63 || offset + 1 + len > dns.length) return -1;
             offset += 1 + len;
         }
-        return offset;
+        return -1;
     }
 
     private void inject(int session, FileOutputStream output, byte[] packet) throws IOException {
