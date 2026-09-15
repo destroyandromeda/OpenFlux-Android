@@ -71,11 +71,19 @@ Android VPN or SOCKS5 client -> encrypted document transport -> Linux exit node 
 
 OpenFlux is experimental research software, not an audited replacement for
 WireGuard or another mature VPN. The Android tunnel currently supports IPv4 and
-TCP; arbitrary UDP and IPv6 are not tunneled (an IPv6 target or a UDP-only
-request is rejected with a proper protocol error, not tunneled silently). The
+TCP; arbitrary UDP and IPv6 are not tunneled. Non-DNS UDP receives a local ICMP
+port-unreachable response so applications can fall back to TCP instead of
+hanging on QUIC. The
 document provider can still observe metadata such as connection times, traffic
 sizes and encrypted payloads. Anyone with document edit access can disrupt the
 connection.
+
+The Volga relay is deliberately bounded for Android: 64 workers, a queue of
+4096 packets and one packet per relay batch. These limits avoid exhausting the
+phone's sockets under media traffic and keep Yandex relay requests below its
+operation-size limit. After changing the client or exit-node binary, restart
+both the Android VPN service and the affected exit-node service so they use a
+fresh Volga session.
 
 Use the software only on systems and networks you own or are authorized to
 test.

@@ -2,6 +2,16 @@
 
 All notable changes to this fork are documented here.
 
+## Unreleased - 2026-09-15
+
+### Fixed
+
+- bounded the Android Volga relay to 64 workers and one packet per batch;
+- return ICMP port-unreachable for unsupported non-DNS UDP so applications can
+  fall back from QUIC to TCP;
+- documented the TCP-only media and UDP behavior and the required fresh-session
+  restart procedure.
+
 ## 0.5.3 - 2026-09-12
 
 ### Fixed
